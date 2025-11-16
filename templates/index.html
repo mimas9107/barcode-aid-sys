@@ -1,81 +1,285 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-Hant">
 <head>
-<meta charset="UTF-8">
-<title>條碼查詢系統</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>條碼查詢 - MVP</title>
+
 <style>
-body { font-family: Arial; padding: 20px; }
-#preview { width: 100%; border: 1px solid #333; margin-top: 10px; }
-.result-box { margin-top: 20px; padding: 10px; border: 1px solid #666; background: #f8f8f8; }
+  body { font-family: Arial, sans-serif; margin: 0; padding: 14px; background:#f2f4f7; color:#222; }
+  h2 { text-align:center; margin: 6px 0 14px 0; font-size:1.2rem; }
+  .btn { width:100%; padding:12px; border-radius:8px; border:none; font-size:1rem; cursor:pointer; margin-bottom:10px; }
+  .btn-primary { background:#2b7cff; color:#fff; }
+  .btn-muted { background:#eee; color:#333; }
+  #preview { width:100%; height:240px; background:#000; border-radius:8px; overflow:hidden; display:block; }
+  .panel { background:#fff; padding:12px; border-radius:8px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); margin-top:12px;}
+  .row { display:flex; margin-bottom:8px; }
+  .label { width:32%; font-weight:700; color:#333; }
+  .value { width:68%; word-break:break-all; }
+  #history { margin-top:12px; }
+  .hist-item { padding:10px; border-bottom:1px solid #efefef; display:block; }
+  .hist-top { display:flex; justify-content:space-between; gap:8px; margin-bottom:6px; }
+  .time { color:#888; font-size:0.85rem; }
+  .barcode-text {font-family:monospace; color:#111;}
+  .empty { color:#666; text-align:center; padding:12px; }
+  .controls { display:flex; gap:8px; margin-top:8px; }
+  .controls .btn { flex:1; padding:10px; }
+  @media(min-width:600px){ #preview{height:320px} .btn{font-size:1.05rem} }
 </style>
 
+<!-- QuaggaJS -->
 <script src="https://unpkg.com/quagga/dist/quagga.min.js"></script>
 </head>
 <body>
 
-<h2>📦 條碼查詢系統</h2>
-<p>請點下方按鈕啟動相機掃描 Code128 條碼</p>
+<h2>📦 條碼查詢（MVP）</h2>
 
-<button onclick="startScanner()">啟動相機掃描</button>
-
+<!-- 啟動 / 停止掃描 -->
+<button id="btn-scan" class="btn btn-primary">啟動相機掃描</button>
 <div id="preview"></div>
 
-<div class="result-box" id="result-box" style="display:none;">
-    <h3>查詢結果</h3>
-    <div id="result"></div>
+<!-- 目前條碼與結果卡片 -->
+<div class="panel" id="current-panel" style="display:none;">
+  <div class="row"><div class="label">目前條碼</div><div class="value barcode-text" id="current-barcode"></div></div>
+  <div class="row"><div class="label">品名</div><div class="value" id="current-name"></div></div>
+  <div class="row"><div class="label">庫存</div><div class="value" id="current-qty"></div></div>
+  <div class="row"><div class="label">倉位</div><div class="value" id="current-loc"></div></div>
+  <div class="row"><div class="label">用途</div><div class="value" id="current-usage"></div></div>
+
+  <div class="controls">
+    <button id="btn-rescan" class="btn btn-muted">重新掃描</button>
+    <button id="btn-clear" class="btn btn-muted">清除歷史</button>
+  </div>
+</div>
+
+<!-- 歷史清單 -->
+<div class="panel" id="history-panel">
+  <h3 style="margin:0 0 8px 0;">掃描歷史（最近 10 筆）</h3>
+  <div id="history"></div>
 </div>
 
 <script>
-function startScanner() {
-    Quagga.init({
-        inputStream : {
-            name : "Live",
-            type : "LiveStream",
-            target: document.querySelector('#preview')
-        },
-        decoder : {
-            readers : ["code_128_reader"]
-        }
-    }, function(err) {
-        if (err) {
-            console.error(err);
-            alert("無法啟動相機：" + err);
-            return;
-        }
-        Quagga.start();
-    });
+/*
+  功能說明：
+  - 使用 Quagga 啟動手機相機掃一維 Code128（可擴充支援其他 reader）
+  - 掃到 barcode 後呼叫 /api/query?code=... 取得資料
+  - 顯示在上方「目前條碼」區塊，並把該筆 push 到歷史 (最多保留 MAX_HISTORY)
+  - 使用 localStorage 保留歷史，頁面重新整理仍保留
+  - 防抖：短時間內重複偵測同一 barcode 則忽略（DEBOUNCE_MS）
+*/
 
-    Quagga.onDetected(function(data) {
-        const code = data.codeResult.code;
-        Quagga.stop();
-        queryAPI(code);
-    });
+const MAX_HISTORY = 10;        // 保留歷史筆數
+const DEBOUNCE_MS = 1500;     // 同一條碼在此時間內重複偵測會被忽略
+let lastDetected = { code: null, time: 0 };
+let scanning = false;
+let historyList = []; // {ts, barcode, status, product_name, qty, location, usage}
+
+// 元素
+const btnScan = document.getElementById('btn-scan');
+const preview = document.getElementById('preview');
+const currentPanel = document.getElementById('current-panel');
+const currentBarcode = document.getElementById('current-barcode');
+const currentName = document.getElementById('current-name');
+const currentQty = document.getElementById('current-qty');
+const currentLoc = document.getElementById('current-loc');
+const currentUsage = document.getElementById('current-usage');
+const historyDiv = document.getElementById('history');
+const btnRescan = document.getElementById('btn-rescan');
+const btnClear = document.getElementById('btn-clear');
+
+// 讀取 localStorage 初始歷史
+function loadHistoryFromStorage() {
+  try {
+    const raw = localStorage.getItem('scan_history_v1');
+    if (raw) historyList = JSON.parse(raw) || [];
+  } catch(e) { historyList = []; }
+}
+function saveHistoryToStorage() {
+  try { localStorage.setItem('scan_history_v1', JSON.stringify(historyList)); } catch(e){/* ignore */ }
 }
 
-function queryAPI(code) {
-    const api = `/api/query?code=${encodeURIComponent(code)}`;
-    fetch(api)
-        .then(r => r.json())
-        .then(res => {
-            let html = "";
-            if (res.status === "ok") {
-                html += `<b>條碼：</b> ${res.barcode}<br>`;
-                html += `<b>品名：</b> ${res.product_name}<br>`;
-                html += `<b>庫存：</b> ${res.qty}<br>`;
-                html += `<b>倉位：</b> ${res.location}<br>`;
-                html += `<b>用途：</b> ${res.usage}<br>`;
-            } else {
-                html = `<span style="color:red;">${res.msg}</span>`;
-            }
-
-            document.getElementById("result").innerHTML = html;
-            document.getElementById("result-box").style.display = "block";
-        })
-        .catch(err => {
-            alert("查詢失敗：" + err);
-        });
+// 將一筆結果 push 到 history，並渲染
+function pushHistory(item) {
+  historyList.unshift(item); // newest at top
+  if (historyList.length > MAX_HISTORY) historyList = historyList.slice(0, MAX_HISTORY);
+  saveHistoryToStorage();
+  renderHistory();
 }
+
+// 渲染歷史
+function renderHistory() {
+  if (!historyList.length) {
+    historyDiv.innerHTML = '<div class="empty">尚無掃描紀錄</div>';
+    return;
+  }
+  historyDiv.innerHTML = '';
+  historyList.forEach(h => {
+    const el = document.createElement('div');
+    el.className = 'hist-item';
+    const top = document.createElement('div');
+    top.className = 'hist-top';
+    top.innerHTML = `<div class="time">${new Date(h.ts).toLocaleString()}</div><div class="barcode-text">${h.barcode}</div>`;
+    const detail = document.createElement('div');
+    if (h.status === 'ok') {
+      detail.innerHTML = `<div style="font-weight:600">${escapeHtml(h.product_name)}</div>
+                          <div style="color:#444">庫存：${escapeHtml(String(h.qty))} &nbsp;｜&nbsp; 倉位：${escapeHtml(h.location)}</div>
+                          <div style="color:#666; margin-top:6px;">用途：${escapeHtml(h.usage)}</div>`;
+    } else {
+      detail.innerHTML = `<div style="color:#b00; font-weight:600;">${escapeHtml(h.msg || '查詢錯誤')}</div>`;
+    }
+    el.appendChild(top);
+    el.appendChild(detail);
+    historyDiv.appendChild(el);
+  });
+}
+
+// 更新上方目前顯示卡
+function updateCurrent(resultObj) {
+  currentPanel.style.display = 'block';
+  currentBarcode.textContent = resultObj.barcode || '';
+  currentName.textContent = resultObj.product_name || (resultObj.status === 'not_found' ? '查無資料' : '');
+  currentQty.textContent = (resultObj.status === 'ok') ? String(resultObj.qty) : '-';
+  currentLoc.textContent = resultObj.location || '-';
+  currentUsage.textContent = resultObj.usage || '-';
+}
+
+// 呼叫後端 API 查條碼
+async function fetchItem(barcode) {
+  const api = `/api/query?code=${encodeURIComponent(barcode)}`;
+  const ts = Date.now();
+  // 先把目前條碼顯示（避免等待太久）
+  updateCurrent({ barcode, status: 'pending' });
+
+  try {
+    const r = await fetch(api);
+    const json = await r.json();
+
+    if (json.status === 'ok') {
+      const item = {
+        ts, barcode,
+        status: 'ok',
+        product_name: json.product_name || '',
+        qty: json.qty || '',
+        location: json.location || '',
+        usage: json.usage || ''
+      };
+      updateCurrent(item);
+      pushHistory(item);
+    } else if (json.status === 'not_found') {
+      const item = { ts, barcode, status: 'not_found', msg: '查無此條碼' };
+      updateCurrent(item);
+      pushHistory(item);
+    } else {
+      const item = { ts, barcode, status: 'error', msg: json.msg || '未知錯誤' };
+      updateCurrent(item);
+      pushHistory(item);
+    }
+  } catch (e) {
+    const item = { ts, barcode, status: 'error', msg: String(e) };
+    updateCurrent(item);
+    pushHistory(item);
+  }
+}
+
+// 啟動 Quagga 掃描（Code128）
+function startQuagga() {
+  if (scanning) return;
+  scanning = true;
+  btnScan.textContent = '停止掃描';
+  btnScan.classList.remove('btn-primary');
+  btnScan.classList.add('btn-muted');
+
+  Quagga.init({
+    inputStream: {
+      type: "LiveStream",
+      target: preview,
+      constraints: { facingMode: "environment" } // 後鏡頭
+    },
+    decoder: {
+      readers: ["code_128_reader"] // 只讀一維 Code128; 如需加 QR 可擴充
+    },
+    locate: true
+  }, function(err) {
+    if (err) {
+      console.error('Quagga init error', err);
+      alert('無法啟動相機：' + err);
+      scanning = false;
+      btnScan.textContent = '啟動相機掃描';
+      btnScan.classList.remove('btn-muted');
+      btnScan.classList.add('btn-primary');
+      return;
+    }
+    Quagga.start();
+  });
+
+  Quagga.onDetected(onDetectedHandler);
+}
+
+// 停止 Quagga
+function stopQuagga() {
+  if (!scanning) return;
+  scanning = false;
+  Quagga.offDetected(onDetectedHandler);
+  try { Quagga.stop(); } catch(e){/* ignore */ }
+  btnScan.textContent = '啟動相機掃描';
+  btnScan.classList.remove('btn-muted');
+  btnScan.classList.add('btn-primary');
+}
+
+// 偵測事件處理（包含去重）
+function onDetectedHandler(data) {
+  const code = data && data.codeResult && data.codeResult.code;
+  if (!code) return;
+  const now = Date.now();
+
+  // 防抖：同一 barcode 在短時間內忽略重複
+  if (lastDetected.code === code && (now - lastDetected.time) < DEBOUNCE_MS) {
+    return;
+  }
+  lastDetected = { code, time: now };
+
+  // 停 scanner（如需連續掃可以改為不 stop）
+  try { Quagga.stop(); } catch(e){}
+  scanning = false;
+  btnScan.textContent = '啟動相機掃描';
+  btnScan.classList.remove('btn-muted');
+  btnScan.classList.add('btn-primary');
+
+  // 呼叫 API 並顯示
+  fetchItem(code);
+}
+
+// small helper for escaping HTML
+function escapeHtml(s) {
+  if (!s) return '';
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// UI 按鈕綁定
+btnScan.addEventListener('click', () => {
+  if (!scanning) startQuagga();
+  else stopQuagga();
+});
+btnRescan.addEventListener('click', () => { // 重新掃描：清掉目前顯示但保留歷史
+  currentBarcode.textContent = '';
+  currentName.textContent = '';
+  currentQty.textContent = '';
+  currentLoc.textContent = '';
+  currentUsage.textContent = '';
+  if (!scanning) startQuagga();
+});
+btnClear.addEventListener('click', () => {
+  if (!confirm('確定要清除本機歷史紀錄嗎？')) return;
+  historyList = [];
+  saveHistoryToStorage();
+  renderHistory();
+  // 同時清除目前顯示
+  currentPanel.style.display = 'none';
+});
+
+// Initialize from storage & render
+loadHistoryFromStorage();
+renderHistory();
 </script>
-
 </body>
 </html>
