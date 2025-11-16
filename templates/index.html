@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>條碼查詢系統</title>
+<style>
+body { font-family: Arial; padding: 20px; }
+#preview { width: 100%; border: 1px solid #333; margin-top: 10px; }
+.result-box { margin-top: 20px; padding: 10px; border: 1px solid #666; background: #f8f8f8; }
+</style>
+
+<script src="https://unpkg.com/quagga/dist/quagga.min.js"></script>
+</head>
+<body>
+
+<h2>📦 條碼查詢系統</h2>
+<p>請點下方按鈕啟動相機掃描 Code128 條碼</p>
+
+<button onclick="startScanner()">啟動相機掃描</button>
+
+<div id="preview"></div>
+
+<div class="result-box" id="result-box" style="display:none;">
+    <h3>查詢結果</h3>
+    <div id="result"></div>
+</div>
+
+<script>
+function startScanner() {
+    Quagga.init({
+        inputStream : {
+            name : "Live",
+            type : "LiveStream",
+            target: document.querySelector('#preview')
+        },
+        decoder : {
+            readers : ["code_128_reader"]
+        }
+    }, function(err) {
+        if (err) {
+            console.error(err);
+            alert("無法啟動相機：" + err);
+            return;
+        }
+        Quagga.start();
+    });
+
+    Quagga.onDetected(function(data) {
+        const code = data.codeResult.code;
+        Quagga.stop();
+        queryAPI(code);
+    });
+}
+
+function queryAPI(code) {
+    const api = `/api/query?code=${encodeURIComponent(code)}`;
+    fetch(api)
+        .then(r => r.json())
+        .then(res => {
+            let html = "";
+            if (res.status === "ok") {
+                html += `<b>條碼：</b> ${res.barcode}<br>`;
+                html += `<b>品名：</b> ${res.product_name}<br>`;
+                html += `<b>庫存：</b> ${res.qty}<br>`;
+                html += `<b>倉位：</b> ${res.location}<br>`;
+                html += `<b>用途：</b> ${res.usage}<br>`;
+            } else {
+                html = `<span style="color:red;">${res.msg}</span>`;
+            }
+
+            document.getElementById("result").innerHTML = html;
+            document.getElementById("result-box").style.display = "block";
+        })
+        .catch(err => {
+            alert("查詢失敗：" + err);
+        });
+}
+</script>
+
+</body>
+</html>
